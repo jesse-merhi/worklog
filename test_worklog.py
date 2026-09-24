@@ -639,6 +639,7 @@ output_path.write_text(json.dumps({"title": "No diary work", "bullets": []}))
         self.assertIn(purpose, request["conversation_requests"])
         self.assertNotIn("Private injected rules", request["conversation_requests"])
         self.assertEqual(request["existing_entry"], "")
+        self.assertEqual(request["day_topics"], [])
         self.assertEqual([m["text"] for m in request["messages"]],
                          ["Export now includes invoice dates."])
         self.assertNotIn(purpose, self.note_path().read_text(encoding="utf-8"))

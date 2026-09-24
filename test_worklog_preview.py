@@ -38,6 +38,17 @@ import sys
 args = sys.argv[1:]
 request = json.load(sys.stdin)
 Path(__file__).with_name('request.json').write_text(json.dumps(request))
+mode = Path(__file__).with_name('mode.txt')
+
+def shared_summary():
+    title = next((topic for topic in request['day_topics']
+                  if topic.startswith('Nimbus telemetry ')),
+                 'Nimbus telemetry storage and access review')
+    prior = [line[2:] for line in request['existing_entry'].splitlines()
+             if line.startswith('- ')]
+    bullets = list(dict.fromkeys(prior + [item['text'] for item in request['messages']]))
+    return {'title': title, 'bullets': bullets}
+
 if '--safe-mode' in args:
     required = ['--print', '--disable-slash-commands', '--strict-mcp-config',
                 '--no-session-persistence', '--output-format', '--json-schema',
@@ -52,7 +63,6 @@ if '--safe-mode' in args:
         sys.exit(5)
     if os.environ.get('CLAUDECODE') or os.environ.get('CLAUDE_CODE_SESSION_ID'):
         sys.exit(6)
-    mode = Path(__file__).with_name('mode.txt')
     if mode.exists() and mode.read_text() == 'invalid':
         print(json.dumps({'type': 'result', 'subtype': 'success',
                           'is_error': False, 'structured_output': {'title': 'bad'}}))
@@ -62,22 +72,24 @@ if '--safe-mode' in args:
                           'is_error': True, 'structured_output':
                           {'title': 'Work', 'bullets': ['Untrusted result.']}}))
         sys.exit(0)
+    summary = shared_summary() if mode.exists() and mode.read_text() == 'shared' else {
+        'title': 'Work', 'bullets': [item['text'] for item in request['messages']]}
     output = {'type': 'result', 'subtype': 'success', 'is_error': False,
-              'structured_output': {'title': 'Work', 'bullets': [
-                  item['text'] for item in request['messages']]}}
+              'structured_output': summary}
     print(json.dumps(output))
 else:
     if '--ignore-user-config' not in args or '--output-last-message' not in args:
         sys.exit(7)
     output = Path(args[args.index('--output-last-message') + 1])
-    mode = Path(__file__).with_name('mode.txt')
     if mode.exists() and mode.read_text() == 'link':
         bullets = ['Review [PR](https://github.com/example/project/pull/42).']
     elif mode.exists() and mode.read_text() == 'skip':
         bullets = []
     else:
         bullets = [item['text'] for item in request['messages']]
-    output.write_text(json.dumps({'title': 'Work', 'bullets': bullets}))
+    summary = shared_summary() if mode.exists() and mode.read_text() == 'shared' else {
+        'title': 'Work', 'bullets': bullets}
+    output.write_text(json.dumps(summary))
 """,
             encoding="utf-8",
         )
@@ -219,6 +231,268 @@ else:
         self.assertEqual(note.count("<!-- worklog:"), 4)
         self.assertEqual(len(list((self.state / "checkpoints").glob("*.json"))), 2)
 
+    def test_related_sources_share_heading_and_keep_independent_updates(self):
+        (self.root / "mode.txt").write_text("shared")
+        codex = self.root / "codex.jsonl"
+        claude = self.root / "claude.jsonl"
+        self.write_lines(codex, self.codex_records(
+            text="Nimbus telemetry storage and access review: map storage."))
+        self.write_lines(claude, [self.claude_record(
+            "user", "Nimbus telemetry access review: confirm access.")])
+
+        self.assertEqual(self.hook(codex, "codex").returncode, 0)
+        first = self.drain("codex")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        note_path = next(self.vault.rglob("*.md"))
+        manual = "\nManual note: keep this paragraph in place.\n"
+        note_path.write_text(note_path.read_text() + manual, encoding="utf-8")
+
+        self.assertEqual(self.hook(claude, "claude").returncode, 0)
+        second = self.drain("claude")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        request = json.loads((self.root / "request.json").read_text())
+        self.assertEqual(request["day_topics"],
+                         ["Nimbus telemetry storage and access review"])
+        self.assertEqual(request["existing_entry"], "")
+        self.assertNotIn("map storage.", json.dumps(request))
+        self.assertNotIn("codex://threads/same", json.dumps(request))
+        note = note_path.read_text()
+        self.assertEqual(note.count("## Nimbus telemetry storage and access review"), 1)
+        self.assertNotIn("## Nimbus telemetry access review", note)
+        self.assertIn("codex://threads/same", note)
+        self.assertIn("claude --resume same", note)
+        self.assertIn("map storage.", worklog.existing_entry(note, "same"))
+        self.assertNotIn("confirm access.", worklog.existing_entry(note, "same"))
+        self.assertIn("confirm access.", worklog.existing_entry(note, "claude:same"))
+        self.assertNotIn("map storage.", worklog.existing_entry(note, "claude:same"))
+        self.assertEqual(note.count(manual), 1)
+
+        with codex.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self.codex_records(
+                text="Nimbus telemetry: verify storage retention.")[1]) + "\n")
+        self.assertEqual(self.hook(codex, "codex").returncode, 0)
+        updated = self.drain("codex")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        note = note_path.read_text()
+        self.assertEqual(note.count("## Nimbus telemetry storage and access review"), 1)
+        self.assertIn("verify storage retention.", worklog.existing_entry(note, "same"))
+        self.assertIn("confirm access.", worklog.existing_entry(note, "claude:same"))
+
+        with claude.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self.claude_record(
+                "assistant", "Nimbus telemetry: document access controls.")) + "\n")
+        self.assertEqual(self.hook(claude, "claude").returncode, 0)
+        updated = self.drain("claude")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        request = json.loads((self.root / "request.json").read_text())
+        self.assertIn("## Nimbus telemetry storage and access review",
+                      request["existing_entry"])
+        note = note_path.read_text()
+        self.assertEqual(note.count("## Nimbus telemetry storage and access review"), 1)
+        self.assertIn("verify storage retention.", worklog.existing_entry(note, "same"))
+        self.assertIn("document access controls.",
+                      worklog.existing_entry(note, "claude:same"))
+        self.assertEqual(note.count(manual), 1)
+        self.assertEqual(len(list((self.state / "checkpoints").glob("*.json"))), 2)
+        self.assertEqual(json.loads(worklog.checkpoint_path(
+            self.state, "same").read_text())["cursor"], codex.stat().st_size)
+        self.assertEqual(json.loads(worklog.checkpoint_path(
+            self.state, "claude:same").read_text())["cursor"], claude.stat().st_size)
+
+    def test_unrelated_capture_preserves_colliding_legacy_topics(self):
+        billing = worklog.render_entry("billing", {
+            "title": "Nimbus", "bullets": ["Prepared the billing CSV export."],
+        })
+        retention = worklog.render_entry("retention", {
+            "title": "Nimbus", "bullets": ["Reviewed diagnostic retention."],
+        })
+        note_path = self.vault / "daily_notes" / datetime.now().astimezone().strftime("%d-%m-%Y.md")
+        note_path.parent.mkdir(parents=True)
+        old_note = billing + "\n\n" + retention + "\n"
+        note_path.write_text(old_note, encoding="utf-8")
+        transcript = self.root / "codex.jsonl"
+        self.write_lines(transcript, self.codex_records(text="Prepare the Orion launch guide."))
+
+        self.assertEqual(self.hook(transcript, "codex").returncode, 0)
+        result = self.drain("codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        request = json.loads((self.root / "request.json").read_text())
+        self.assertEqual(request["day_topics"], [])
+        self.assertEqual(request["existing_entry"], "")
+        note = note_path.read_text(encoding="utf-8")
+        self.assertTrue(note.startswith(old_note))
+        self.assertEqual(note.count("## Nimbus\n"), 2)
+        self.assertEqual(note.count("## Work\n"), 1)
+        self.assertIn("Prepare the Orion launch guide.", note)
+
+        revised_billing = worklog.render_entry("billing", {
+            "title": "Nimbus", "bullets": ["Exported the billing CSV."],
+        })
+        updated = worklog.upsert_entry(note, "billing", revised_billing)
+        self.assertEqual(updated.count("## Nimbus\n"), 2)
+        self.assertIn(retention, updated)
+        third = worklog.render_entry("third", {
+            "title": "Nimbus", "bullets": ["Reviewed launch pricing."],
+        })
+        ambiguous = worklog.upsert_entry(updated, "third", third)
+        self.assertEqual(ambiguous.count("## Nimbus\n"), 3)
+        self.assertIn("Exported the billing CSV.", ambiguous)
+        self.assertIn("Reviewed diagnostic retention.", ambiguous)
+
+    def test_known_group_survives_member_updates_and_title_changes(self):
+        def rendered(source, title, detail):
+            return worklog.render_entry(source, {"title": title, "bullets": [detail]})
+
+        title = "Nimbus telemetry storage and access review"
+        first = rendered("first", title, "Mapped storage.")
+        second = rendered("second", title, "Confirmed access.")
+        third = rendered("third", title, "Checked retention.")
+        note = worklog.upsert_entry("", "first", first)
+        note = worklog.upsert_entry(note, "second", second)
+        note = worklog.upsert_entry(note, "third", third)
+        self.assertEqual(note.count("## " + title), 1)
+
+        updated = rendered("second", title, "Confirmed access policy.")
+        note = worklog.upsert_entry(note, "second", updated)
+        self.assertEqual(note.count("## " + title), 1)
+        self.assertIn("Confirmed access policy.", worklog.existing_entry(note, "second"))
+        self.assertIn("Checked retention.", worklog.existing_entry(note, "third"))
+
+        changed = rendered("second", "Nimbus diagnostics", "Reviewed diagnostics.")
+        note = worklog.upsert_entry(note, "second", changed)
+        self.assertEqual(note.count("## " + title), 1)
+        self.assertEqual(note.count("## Nimbus diagnostics"), 1)
+        self.assertIn("Checked retention.", worklog.existing_entry(note, "third"))
+        note = worklog.upsert_entry(note, "second", updated)
+        self.assertEqual(note.count("## " + title), 1)
+        self.assertIn("Confirmed access policy.", worklog.existing_entry(note, "second"))
+
+        changed = rendered("first", "Nimbus billing export", "Prepared records.")
+        note = worklog.upsert_entry(note, "first", changed)
+        self.assertEqual(note.count("## " + title), 1)
+        self.assertEqual(note.count("## Nimbus billing export"), 1)
+        self.assertIn("Confirmed access policy.", worklog.existing_entry(note, "second"))
+        self.assertIn("Checked retention.", worklog.existing_entry(note, "third"))
+        self.assertIn("Prepared records.", worklog.existing_entry(note, "first"))
+
+        changed = rendered("second", "Nimbus diagnostics", "Reviewed diagnostics.")
+        note = worklog.upsert_entry(note, "second", changed)
+        self.assertEqual(note.count("## " + title), 1)
+        self.assertIn("Checked retention.", worklog.existing_entry(note, "third"))
+        self.assertIn("Reviewed diagnostics.", worklog.existing_entry(note, "second"))
+
+    def test_changed_legacy_title_joins_only_unambiguous_topic_in_same_region(self):
+        def rendered(source, title, detail):
+            return worklog.render_entry(source, {"title": title, "bullets": [detail]})
+
+        canonical = "Nimbus telemetry storage and access review"
+        first = rendered("first", canonical, "Mapped storage.")
+        second = rendered("second", "Nimbus telemetry access review", "Confirmed access.")
+        note = first + "\n\n" + second + "\n"
+        note = worklog.upsert_entry(note, "second", rendered("second", canonical, "Confirmed access."))
+        self.assertEqual(note.count("## " + canonical), 1)
+        self.assertIn("Mapped storage.", worklog.existing_entry(note, "first"))
+        self.assertIn("Confirmed access.", worklog.existing_entry(note, "second"))
+
+        manual = "\n\nManual decision between workstreams.\n\n"
+        separated = first + manual + second + "\n"
+        unchanged = worklog.upsert_entry(
+            separated, "second", rendered("second", canonical, "Confirmed access."))
+        self.assertIn(manual, unchanged)
+        self.assertEqual(unchanged.count("## " + canonical), 2)
+        self.assertLess(unchanged.index("Mapped storage."), unchanged.index(manual))
+        self.assertGreater(unchanged.index("Confirmed access."), unchanged.index(manual))
+
+    def test_manual_section_restores_heading_for_updated_hidden_group(self):
+        title = "Nimbus access review"
+        note = ""
+        for source, detail in (("first", "Mapped access."), ("second", "Checked readers."),
+                               ("third", "Confirmed retention.")):
+            note = worklog.upsert_entry(note, source, worklog.render_entry(source, {
+                "title": title, "bullets": [detail],
+            }))
+        marker = worklog.marker_pair("second")[0]
+        manual = "## Handwritten planning\n\nKeep this decision.\n\n"
+        note = note.replace(marker, manual + marker, 1)
+        update = worklog.render_entry("third", {
+            "title": title, "bullets": ["Confirmed retention policy."],
+        })
+
+        updated = worklog.upsert_entry(note, "third", update)
+        self.assertEqual(updated.count("## " + title + "\n"), 2)
+        self.assertEqual(updated.count(manual), 1)
+        self.assertLess(updated.index(manual), updated.rindex("## " + title))
+        self.assertIn("Mapped access.", worklog.existing_entry(updated, "first"))
+        self.assertIn("Checked readers.", worklog.existing_entry(updated, "second"))
+        self.assertIn("Confirmed retention policy.", worklog.existing_entry(updated, "third"))
+        self.assertEqual(worklog.upsert_entry(updated, "third", update), updated)
+
+    def test_distinct_topics_and_old_blocks_remain_updateable(self):
+        first = worklog.render_entry("first", {
+            "title": "Nimbus telemetry storage and access review",
+            "bullets": ["Mapped telemetry storage."],
+        })
+        unrelated = worklog.render_entry("unrelated", {
+            "title": "Nimbus billing export", "bullets": ["Prepared billing records."],
+        })
+        manual = "\n\nManual note between workstreams.\n\n"
+        old_note = first + manual + unrelated + "\n"
+        self.assertEqual(worklog.day_topics(old_note), [
+            "Nimbus telemetry storage and access review", "Nimbus billing export"])
+
+        related = worklog.render_entry("second", {
+            "title": "Nimbus telemetry storage and access review",
+            "bullets": ["Confirmed telemetry access."],
+        })
+        note = worklog.upsert_entry(old_note, "second", related)
+        self.assertEqual(note.count("## Nimbus telemetry storage and access review"), 1)
+        self.assertEqual(note.count("## Nimbus billing export"), 1)
+        self.assertIn(manual, note)
+        self.assertIn("Prepared billing records.", note)
+        self.assertIn("Confirmed telemetry access.", worklog.existing_entry(note, "second"))
+
+        revised = worklog.render_entry("first", {
+            "title": "Nimbus telemetry storage and access review",
+            "bullets": ["Mapped telemetry storage and retention."],
+        })
+        note = worklog.upsert_entry(note, "first", revised)
+        self.assertEqual(note.count("## Nimbus telemetry storage and access review"), 1)
+        self.assertIn("Confirmed telemetry access.", worklog.existing_entry(note, "second"))
+        self.assertIn("Mapped telemetry storage and retention.", note)
+        self.assertIn(manual, note)
+
+        contiguous = first + "\n \n" + unrelated + "\n\n" + related + "\n"
+        grouped = worklog.upsert_entry(contiguous, "second", related)
+        self.assertEqual(grouped.count("## Nimbus telemetry storage and access review"), 2)
+        self.assertEqual(grouped.count("## Nimbus billing export"), 1)
+        self.assertGreater(grouped.index("Confirmed telemetry access."),
+                           grouped.index("## Nimbus billing export"))
+        self.assertEqual(grouped.count("\n \n"), 1)
+
+    def test_malformed_markers_do_not_replace_note(self):
+        entry = worklog.render_entry("new", {
+            "title": "Nimbus telemetry", "bullets": ["Reviewed storage."],
+        })
+        start, end = worklog.marker_pair("old")
+        for note in (start + "\n## Old\n", end, start + "\n## Old\n" + start + end,
+                     "<!-- worklog:bad:start -->"):
+            with self.subTest(note=note):
+                with self.assertRaises(worklog.WorklogError):
+                    worklog.upsert_entry(note, "new", entry)
+
+        transcript = self.root / "codex.jsonl"
+        self.write_lines(transcript, self.codex_records(text="Review Nimbus telemetry."))
+        note_path = self.vault / "daily_notes" / datetime.now().astimezone().strftime("%d-%m-%Y.md")
+        note_path.parent.mkdir(parents=True)
+        damaged = "Manual note stays.\n\n" + start + "\n## Old\n"
+        note_path.write_text(damaged, encoding="utf-8")
+        self.assertEqual(self.hook(transcript, "codex").returncode, 0)
+        result = self.drain("codex")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(note_path.read_text(encoding="utf-8"), damaged)
+        self.assertEqual(list((self.state / "checkpoints").glob("*.json")), [])
+        self.assertEqual(len(list((self.state / "failed").glob("*.json"))), 1)
+
     def test_claude_invalid_structured_output_fails_then_retries_snapshot(self):
         transcript = self.root / "claude.jsonl"
         self.write_lines(transcript, [self.claude_record("user", "Review launch plan.")])
@@ -252,10 +526,10 @@ else:
         prompt = worklog.summary_prompt("", "", "", "", [
             {"role": "user", "text": "Review launch plan.", "timestamp": "2026-09-24T00:00:00+00:00",
              "date": "2026-09-24"}
-        ])
+        ], ["Other topic at https://example.com/unrelated"])
         with self.assertRaisesRegex(worklog.WorklogError, "invented a source URL"):
             worklog.checked_summary(
-                {"title": "Launch", "bullets": ["Review at https://example.com/ticket/1"]},
+                {"title": "Launch", "bullets": ["Review at https://example.com/unrelated"]},
                 prompt,
             )
 

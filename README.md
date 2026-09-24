@@ -34,7 +34,7 @@ A prompt you can paste into an agent:
 
 ## How capture works
 
-`Stop` queues a capture at most hourly after the first capture. `SessionEnd` queues remaining activity. A background worker summarizes the queued text and updates one entry per conversation per day. Subagent activity, injected instructions, tool output, and internal reasoning are excluded from the supported transcript formats.
+`Stop` queues a capture at most hourly after the first capture. `SessionEnd` queues remaining activity. A background worker summarizes the queued text and updates one entry per conversation per day. Related conversations on the same day share a visible topic heading while keeping their own source references and updates. Subagent activity, injected instructions, tool output, and internal reasoning are excluded from the supported transcript formats.
 
 Codex notes link to their conversation. Claude notes include a `claude --resume` reference. Ticket and PR URLs are copied from supplied material; missing URLs are not guessed. Generated summaries can omit details, so retain your original conversations.
 

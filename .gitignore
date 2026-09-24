@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.env
+.env.*
+.worklog/
+state/
+previews/
+notes/
+scope.txt
+installation.json
+*.jsonl
+*.log
+*.bak
